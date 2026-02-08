@@ -46,7 +46,13 @@
           "description": "Temperature for the model"
         }
       },
-      "required": ["enabled", "model", "prompt"],
+      "required": ["enabled"],
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["model", "prompt"]
+      },
       "additionalProperties": false
     },
     "information-search": {
@@ -107,7 +113,13 @@
           "examples": []
         }
       },
-      "required": ["enabled", "model", "prompt"],
+      "required": ["enabled"],
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["model", "prompt"]
+      },
       "additionalProperties": false
     },
     "student-assistant": {
@@ -172,7 +184,13 @@
           "examples": []
         }
       },
-      "required": ["enabled", "model"],
+      "required": ["enabled"],
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["model"]
+      },
       "additionalProperties": false
     },
     "shields": {
