@@ -44,6 +44,11 @@
         "temperature": {
           "type": "number",
           "description": "Temperature for the model"
+        },
+        "prompt_b": {
+          "type": "string",
+          "description": "Alternative prompt for A/B testing",
+          "minLength": 1
         }
       },
       "required": ["enabled"],
@@ -221,6 +226,30 @@
           "examples": [
             []
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "feedback": {
+      "type": "object",
+      "description": "Configuration for user feedback collection on AI responses",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable or disable feedback collection functionality",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ab_testing": {
+      "type": "object",
+      "description": "Configuration for A/B testing of prompts",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable or disable A/B testing",
+          "default": false
         }
       },
       "additionalProperties": false
