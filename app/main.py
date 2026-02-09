@@ -21,7 +21,6 @@ app = FastAPI(title="Canopy Backend API")
 
 # Load configuration with fallback for testing
 config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
-# config_path = os.getenv("CANOPY_CONFIG_PATH", "./canopy-config.yaml")
 if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -35,6 +34,7 @@ if os.path.exists(config_path):
         "student-assistant": "student-assistant" in config and config["student-assistant"]["enabled"] == True,
         "shields": "shields" in config and config["shields"]["enabled"] == True,
         "feedback": "feedback" in config and config["feedback"]["enabled"] == True,
+        "ab_testing": "ab_testing" in config and config["ab_testing"]["enabled"] == True,
     }
 
     # Shields configuration
@@ -56,6 +56,7 @@ else:
         "student-assistant": False,
         "shields": False,
         "feedback": False,
+        "ab_testing": False,
     }
     SHIELDS_CONFIG = {}
 
@@ -190,6 +191,9 @@ feedback_logger.addHandler(_feedback_handler)
 # In-memory feedback store (data lost on restart - acceptable for enablement)
 feedback_store: List[Dict[str, Any]] = []
 
+# In-memory A/B feedback store (separate from regular feedback)
+ab_feedback_store: List[Dict[str, Any]] = []
+
 class PromptRequest(BaseModel):
     prompt: str
 
@@ -199,6 +203,14 @@ class FeedbackRequest(BaseModel):
     rating: str  # "thumbs_up" or "thumbs_down"
     feature: str = "summarize"
     comment: Optional[str] = None
+
+class ABFeedbackRequest(BaseModel):
+    input_text: str
+    response_a: str
+    response_b: str
+    preference: str  # "a" or "b"
+    prompt_mapping: Dict[str, str]  # {"a": "prompt", "b": "prompt_b"}
+    feature: str = "summarize"
 
 @app.get("/feature-flags")
 async def get_feature_flags() -> Dict[str, Any]:
@@ -298,6 +310,134 @@ async def export_feedback_for_eval():
         media_type="application/x-yaml",
         headers={"Content-Disposition": "attachment; filename=feedback-eval-dataset.yaml"},
     )
+
+
+@app.post("/summarize/ab")
+async def summarize_ab(request: PromptRequest):
+    """Run the same input through two different prompts for A/B comparison."""
+    if not FEATURE_FLAGS.get("summarize", False):
+        raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
+    if not FEATURE_FLAGS.get("ab_testing", False):
+        raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
+
+    prompt_a_text = config["summarize"].get("prompt", "Summarize the following text:")
+    prompt_b_text = config["summarize"].get("prompt_b")
+    if not prompt_b_text:
+        raise HTTPException(status_code=400, detail="prompt_b is not configured in summarize config")
+
+    temperature = config["summarize"].get("temperature", 0.7)
+    max_tokens = config["summarize"].get("max_tokens", 4096)
+    model = config["summarize"]["model"]
+
+    # Randomize which prompt is A vs B to avoid position bias
+    prompts = [("prompt", prompt_a_text), ("prompt_b", prompt_b_text)]
+    random.shuffle(prompts)
+    mapping = {"a": prompts[0][0], "b": prompts[1][0]}
+
+    q = queue.Queue()
+
+    def ab_worker(variant, sys_prompt):
+        """Run inference for one variant and tag chunks."""
+        try:
+            response = llama_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": request.prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+            for r in response:
+                if hasattr(r, 'choices') and r.choices:
+                    delta = r.choices[0].delta
+                    if delta.content:
+                        chunk = f"data: {json.dumps({'variant': variant, 'delta': delta.content})}\n\n"
+                        q.put(chunk)
+        except Exception as e:
+            q.put(f"data: {json.dumps({'variant': variant, 'error': str(e)})}\n\n")
+        finally:
+            q.put(("DONE", variant))
+
+    # Send config event first, then start workers
+    threading.Thread(target=ab_worker, args=("a", prompts[0][1])).start()
+    threading.Thread(target=ab_worker, args=("b", prompts[1][1])).start()
+
+    async def streamer():
+        # First event: send the mapping (frontend stores but doesn't show)
+        yield f"data: {json.dumps({'type': 'ab_config', 'mapping': mapping})}\n\n"
+        done_count = 0
+        while done_count < 2:
+            item = await asyncio.get_event_loop().run_in_executor(None, q.get)
+            if isinstance(item, tuple) and item[0] == "DONE":
+                done_count += 1
+            else:
+                yield item
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(streamer(), media_type="text/event-stream")
+
+
+@app.post("/feedback/ab")
+async def submit_ab_feedback(request: ABFeedbackRequest):
+    """Submit A/B comparison feedback."""
+    if not FEATURE_FLAGS.get("feedback", False):
+        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
+    if not FEATURE_FLAGS.get("ab_testing", False):
+        raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
+
+    # Resolve which actual prompt won
+    winning_prompt = None
+    if request.preference in ("a", "b"):
+        winning_prompt = request.prompt_mapping.get(request.preference)
+
+    ab_entry = {
+        "id": len(ab_feedback_store) + 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "feature": request.feature,
+        "preference": request.preference,
+        "winning_prompt": winning_prompt,
+        "prompt_mapping": request.prompt_mapping,
+        "input_text": request.input_text,
+        "response_a": request.response_a,
+        "response_b": request.response_b,
+    }
+
+    ab_feedback_store.append(ab_entry)
+
+    feedback_logger.info(json.dumps({
+        "event": "ab_feedback_submitted",
+        "feedback_id": ab_entry["id"],
+        "feature": request.feature,
+        "preference": request.preference,
+        "winning_prompt": winning_prompt,
+        "prompt_mapping": request.prompt_mapping,
+        "timestamp": ab_entry["timestamp"],
+    }))
+
+    return {"status": "ok", "feedback_id": ab_entry["id"]}
+
+
+@app.get("/feedback/ab")
+async def list_ab_feedback():
+    """List all A/B feedback entries with win-rate stats."""
+    if not FEATURE_FLAGS.get("feedback", False):
+        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
+    if not FEATURE_FLAGS.get("ab_testing", False):
+        raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
+
+    prompt_a_wins = sum(1 for e in ab_feedback_store if e["winning_prompt"] == "prompt")
+    prompt_b_wins = sum(1 for e in ab_feedback_store if e["winning_prompt"] == "prompt_b")
+    ties = sum(1 for e in ab_feedback_store if e["preference"] == "tie")
+
+    return {
+        "total": len(ab_feedback_store),
+        "prompt_a_wins": prompt_a_wins,
+        "prompt_b_wins": prompt_b_wins,
+        "ties": ties,
+        "entries": ab_feedback_store,
+    }
 
 
 @app.post("/summarize")
