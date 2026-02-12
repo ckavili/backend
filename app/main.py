@@ -35,6 +35,7 @@ if os.path.exists(config_path):
         "shields": "shields" in config and config["shields"]["enabled"] == True,
         "feedback": "feedback" in config and config["feedback"]["enabled"] == True,
         "ab_testing": "ab_testing" in config and config["ab_testing"]["enabled"] == True,
+        "socratic-tutor": "socratic-tutor" in config and config["socratic-tutor"]["enabled"] == True,
     }
 
     # Shields configuration
@@ -57,6 +58,7 @@ else:
         "shields": False,
         "feedback": False,
         "ab_testing": False,
+        "socratic-tutor": False,
     }
     SHIELDS_CONFIG = {}
 
@@ -558,6 +560,68 @@ async def summarize(request: PromptRequest):
         threading.Thread(target=worker_with_shields).start()
     else:
         threading.Thread(target=worker_without_shields).start()
+
+    async def streamer():
+        while True:
+            chunk = await asyncio.get_event_loop().run_in_executor(None, q.get)
+            if chunk is None:
+                break
+            yield chunk
+
+    return StreamingResponse(streamer(), media_type="text/event-stream")
+
+@app.post("/socratic-tutor")
+async def socratic_tutor(request: PromptRequest):
+    # Check if socratic tutor feature is enabled
+    if not FEATURE_FLAGS.get("socratic-tutor", False):
+        raise HTTPException(status_code=404, detail="Socratic tutor feature is not enabled")
+
+    sys_prompt = config["socratic-tutor"].get("prompt", "Help the student discover the answer through questioning:")
+    temperature = config["socratic-tutor"].get("temperature", 0.9)
+    max_tokens = config["socratic-tutor"].get("max_tokens", 1500)
+    model = config["socratic-tutor"]["model"]
+
+    q = queue.Queue()
+
+    def worker():
+        print(f"sending request to model {model} for socratic tutoring")
+        print(f"sys_prompt: {sys_prompt}")
+        print(f"user_prompt: {request.prompt}")
+        try:
+            response = llama_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": request.prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+
+            print(f"[Socratic Tutor] Starting to iterate over response...")
+            for r in response:
+                print(f"[Socratic Tutor] Got response chunk: {r}")
+                if hasattr(r, 'choices') and r.choices:
+                    delta = r.choices[0].delta
+                    print(f"[Socratic Tutor] Delta: {delta}")
+                    if delta.content:
+                        print(f"[Socratic Tutor] Delta content: {delta.content}")
+                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+                        q.put(chunk)
+                    else:
+                        print(f"[Socratic Tutor] Delta has no content")
+                else:
+                    print(f"[Socratic Tutor] Response has no choices")
+
+        except Exception as e:
+            print(f"[Socratic Tutor] Error: {str(e)}")
+            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+        finally:
+            print(f"[Socratic Tutor] Worker done, sending None to queue")
+            q.put(None)
+
+    threading.Thread(target=worker).start()
 
     async def streamer():
         while True:

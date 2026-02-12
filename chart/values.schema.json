@@ -253,6 +253,47 @@
         }
       },
       "additionalProperties": false
+    },
+    "socratic-tutor": {
+      "type": "object",
+      "description": "Configuration for Socratic tutor functionality",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable or disable Socratic tutor functionality",
+          "default": false
+        },
+        "model": {
+          "type": "string",
+          "description": "Model identifier to use for Socratic tutoring (fine-tuned model)",
+          "minLength": 1,
+          "examples": [
+            "socratic-tutor-lora",
+            "llama32-socratic"
+          ]
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Prompt template for Socratic tutor requests",
+          "minLength": 1
+        },
+        "max_tokens": {
+          "type": "number",
+          "description": "Max tokens for the model"
+        },
+        "temperature": {
+          "type": "number",
+          "description": "Temperature for the model"
+        }
+      },
+      "required": ["enabled"],
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["model", "prompt"]
+      },
+      "additionalProperties": false
     }
   },
   "required": ["LLAMA_STACK_URL"],
