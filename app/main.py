@@ -21,7 +21,7 @@ import mlflow
 app = FastAPI(title="Canopy Backend API")
 
 # MLflow prompt registry configuration
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI")
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "https://mlflow.redhat-ods-applications.svc.cluster.local:8443")
 MLFLOW_PROMPT_VERSION = os.getenv("MLFLOW_PROMPT_VERSION")
 if not os.getenv("MLFLOW_TRACKING_AUTH"):
     os.environ["MLFLOW_TRACKING_AUTH"] = "kubernetes"
