@@ -18,9 +18,6 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 import random
 import mlflow
-from opentelemetry.propagate import set_global_textmap
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
 app = FastAPI(title="Canopy Backend API")
 
@@ -56,10 +53,6 @@ mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 mlflow.set_experiment("canopy-backend")
 mlflow.openai.autolog() 
 
-# Set up OTEL trace propagation so LlamaStack server traces
-# are linked to this app's traces in the same trace tree
-set_global_textmap(TraceContextTextMapPropagator())
-HTTPXClientInstrumentor().instrument()
 
 def get_mlflow_prompt(feature):
     """Fetch system prompt from MLflow prompt registry for a given feature.
@@ -412,13 +405,8 @@ async def summarize_ab(request: PromptRequest, raw_request: Request):
 
     q = queue.Queue()
 
-    @mlflow.trace(name="summarize_ab")
     def ab_worker(variant, sys_prompt):
         """Run inference for one variant and tag chunks."""
-        mlflow.update_current_trace(
-            metadata={"mlflow.trace.session": session_id, "model": model, "variant": variant},
-            tags={"mlflow.trace.session": session_id},
-        )
         try:
             response = openai_client.chat.completions.create(
                 model=model,
@@ -535,13 +523,8 @@ async def summarize(request: PromptRequest, raw_request: Request):
 
     q = queue.Queue()
 
-    @mlflow.trace(name="summarize_with_shields")
     def worker_with_shields():
         """Use Responses API when shields are enabled - guardrails handled server-side."""
-        mlflow.update_current_trace(
-            metadata={"mlflow.trace.session": session_id, "model": model, "prompt": request.prompt},
-            tags={"mlflow.trace.session": session_id},
-        )
         print(f"sending request to model {model} with shields (Responses API)")
         try:
             input_shields = SHIELDS_CONFIG.get("input_shields", [])
@@ -613,43 +596,43 @@ async def summarize(request: PromptRequest, raw_request: Request):
         finally:
             q.put(None)
 
-    @mlflow.trace(name="summarize_without_shields")
-    def worker_without_shields():
+    @mlflow.trace
+    def worker_without_shields(messages: list[dict], session_id: str):
         """Use direct inference API when shields are disabled."""
         mlflow.update_current_trace(
-            metadata={"mlflow.trace.session": session_id, "model": model, "prompt": request.prompt},
-            tags={"mlflow.trace.session": session_id},
+            metadata={"mlflow.trace.session": session_id},
         )
         print(f"sending request to model {model} without shields (Inference API)")
+        full_response = ""
         try:
             response = openai_client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": request.prompt},
-                ],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                stream=False,
+                stream=True,
             )
-
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
+            for chunk in response:
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
                     if delta.content:
-                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                        q.put(chunk)
-
+                        full_response += delta.content
+                        q.put(f"data: {json.dumps({'delta': delta.content})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
             q.put(None)
+        return full_response
 
     # Choose worker based on shields feature flag
     if FEATURE_FLAGS.get("shields", False):
         threading.Thread(target=worker_with_shields).start()
     else:
-        threading.Thread(target=worker_without_shields).start()
+        summarize_messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": request.prompt},
+        ]
+        threading.Thread(target=worker_without_shields, args=(summarize_messages, session_id)).start()
 
     async def streamer():
         while True:
@@ -677,13 +660,8 @@ async def summarize_chat(request: ChatRequest, raw_request: Request):
 
     q = queue.Queue()
 
-    @mlflow.trace(name="summarize_chat_with_shields")
     def worker_with_shields():
         """Use Responses API when shields are enabled."""
-        mlflow.update_current_trace(
-            metadata={"mlflow.trace.session": session_id, "model": model},
-            tags={"mlflow.trace.session": session_id},
-        )
         print(f"sending chat request to model {model} with shields (Responses API)")
         try:
             input_shields = SHIELDS_CONFIG.get("input_shields", [])
@@ -738,49 +716,40 @@ async def summarize_chat(request: ChatRequest, raw_request: Request):
         finally:
             q.put(None)
 
-    @mlflow.trace(name="summarize_chat_without_shields")
-    def worker_without_shields():
+    @mlflow.trace
+    def worker_without_shields(messages: list[dict], session_id: str):
         """Use direct inference API when shields are disabled."""
-        span = mlflow.get_current_active_span()
-        user_msgs = [m for m in messages if m.get("role") == "user"]
-        span.set_inputs(user_msgs[-1]["content"] if user_msgs else "")
         mlflow.update_current_trace(
-            metadata={"mlflow.trace.session": session_id, "model": model},
-            tags={"mlflow.trace.session": session_id},
+            metadata={"mlflow.trace.session": session_id},
         )
         print(f"sending chat request to model {model} without shields (Inference API)")
         full_response = ""
         try:
-            # Prepend system message
-            full_messages = [{"role": "system", "content": sys_prompt}] + messages
-
             response = openai_client.chat.completions.create(
                 model=model,
-                messages=full_messages,
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
-
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
+            for chunk in response:
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
                     if delta.content:
                         full_response += delta.content
-                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                        q.put(chunk)
-
+                        q.put(f"data: {json.dumps({'delta': delta.content})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
-            span.set_outputs(full_response)
             q.put(None)
+        return full_response
 
     # Choose worker based on shields feature flag
     if FEATURE_FLAGS.get("shields", False):
         threading.Thread(target=worker_with_shields).start()
     else:
-        threading.Thread(target=worker_without_shields).start()
+        full_messages = [{"role": "system", "content": sys_prompt}] + messages
+        threading.Thread(target=worker_without_shields, args=(full_messages, session_id)).start()
 
     async def streamer():
         while True:
@@ -805,12 +774,7 @@ async def socratic_tutor(request: PromptRequest, raw_request: Request):
 
     q = queue.Queue()
 
-    @mlflow.trace(name="socratic_tutor")
     def worker():
-        mlflow.update_current_trace(
-            metadata={"mlflow.trace.session": session_id, "model": model, "prompt": request.prompt},
-            tags={"mlflow.trace.session": session_id},
-        )
         try:
             response = openai_client.chat.completions.create(
                 model=model,
@@ -887,12 +851,7 @@ async def information_search(request: PromptRequest, raw_request: Request):
 
     Note: The context includes intelligently processed content with preserved tables, formulas, figures, and document structure."""
 
-    @mlflow.trace(name="information_search")
     def worker():
-        mlflow.update_current_trace(
-            metadata={"mlflow.trace.session": session_id, "model": config["summarize"]["model"], "prompt": request.prompt},
-            tags={"mlflow.trace.session": session_id},
-        )
         try:
             response = openai_client.chat.completions.create(
                 model=config["summarize"]["model"],
@@ -936,12 +895,7 @@ async def student_assistant_chat(request: PromptRequest, raw_request: Request):
     session_id = raw_request.headers.get("x-session-id")
     q = queue.Queue()
 
-    @mlflow.trace(name="student_assistant")
     def worker():
-        mlflow.update_current_trace(
-            metadata={"mlflow.trace.session": session_id, "prompt": request.prompt},
-            tags={"mlflow.trace.session": session_id},
-        )
         try:
             from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
             thread_id = str(int(random.random() * 1000000))
