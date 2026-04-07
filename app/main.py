@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from llama_stack_client import LlamaStackClient
+from openai import OpenAI
 import os
 import asyncio
 import json
@@ -17,22 +18,34 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 import random
 import mlflow
+from opentelemetry.propagate import set_global_textmap
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
 app = FastAPI(title="Canopy Backend API")
 
 # MLflow prompt registry configuration
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "https://mlflow.redhat-ods-applications.svc.cluster.local:8443")
-MLFLOW_PROMPT_VERSION = os.getenv("MLFLOW_PROMPT_VERSION")
 if not os.getenv("MLFLOW_TRACKING_AUTH"):
     os.environ["MLFLOW_TRACKING_AUTH"] = "kubernetes"
 if not os.getenv("MLFLOW_TRACKING_INSECURE_TLS"):
     os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"
 
-if not os.getenv("MLFLOW_WORKSPACE"):
-    NAMESPACE_PATH = "/run/secrets/kubernetes.io/serviceaccount/namespace"
-    if os.path.exists(NAMESPACE_PATH):
-        with open(NAMESPACE_PATH) as f:
-            os.environ["MLFLOW_WORKSPACE"] = f.read().strip()
+NAMESPACE_PATH = "/run/secrets/kubernetes.io/serviceaccount/namespace"
+APP_NAMESPACE = os.getenv("MLFLOW_WORKSPACE")
+TOOLINGS_NAMESPACE = os.getenv("MLFLOW_PROMPT_WORKSPACE")
+
+if not APP_NAMESPACE and os.path.exists(NAMESPACE_PATH):
+    with open(NAMESPACE_PATH) as f:
+        APP_NAMESPACE = f.read().strip()
+
+if APP_NAMESPACE:
+    os.environ["MLFLOW_WORKSPACE"] = APP_NAMESPACE
+    if not TOOLINGS_NAMESPACE:
+        # Prompts live in the toolings namespace (e.g. userX-toolings),
+        # while the backend runs in userX-test or userX-prod
+        user_prefix = APP_NAMESPACE.rsplit("-", 1)[0]
+        TOOLINGS_NAMESPACE = f"{user_prefix}-toolings"
 
 SA_TOKEN_PATH = "/run/secrets/kubernetes.io/serviceaccount/token"
 if os.path.exists(SA_TOKEN_PATH):
@@ -40,18 +53,33 @@ if os.path.exists(SA_TOKEN_PATH):
         os.environ["MLFLOW_TRACKING_TOKEN"] = f.read().strip()
 
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.set_experiment("canopy-backend")
+mlflow.openai.autolog() 
+
+# Set up OTEL trace propagation so LlamaStack server traces
+# are linked to this app's traces in the same trace tree
+set_global_textmap(TraceContextTextMapPropagator())
+HTTPXClientInstrumentor().instrument()
 
 def get_mlflow_prompt(feature):
     """Fetch system prompt from MLflow prompt registry for a given feature.
 
-    The MLflow prompt name is read from config[feature]["mlflow_prompt"].
+    Temporarily switches to the toolings workspace to load prompts,
+    then switches back to the app's own workspace for experiment tracking.
     """
     prompt_name = config[feature]["mlflow_prompt"]
-    version = MLFLOW_PROMPT_VERSION or "latest"
-    if version == "latest":
-        prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}@{version}")
-    else:
-        prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}/{version}")
+    version = config[feature].get("mlflow_prompt_version", "latest")
+    original_workspace = os.environ.get("MLFLOW_WORKSPACE")
+    try:
+        if TOOLINGS_NAMESPACE:
+            os.environ["MLFLOW_WORKSPACE"] = TOOLINGS_NAMESPACE
+        if version == "latest":
+            prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}@{version}")
+        else:
+            prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}/{version}")
+    finally:
+        if original_workspace:
+            os.environ["MLFLOW_WORKSPACE"] = original_workspace
     return prompt.template
 
 # Load configuration with fallback for testing
@@ -61,6 +89,7 @@ if os.path.exists(config_path):
         config = yaml.safe_load(f)
 
     llama_client = LlamaStackClient(base_url=config["LLAMA_STACK_URL"])
+    openai_client = OpenAI(base_url=config["LLAMA_STACK_URL"] + "/v1", api_key="no-key-required")
 
     # Feature flags configuration from environment variables
     FEATURE_FLAGS = {
@@ -86,6 +115,7 @@ else:
     # Fallback for testing - config will be loaded by tests
     config = None
     llama_client = None
+    openai_client = None
     FEATURE_FLAGS = {
         "information-search": False,
         "summarize": False,
@@ -358,13 +388,14 @@ async def export_feedback_for_eval():
 
 
 @app.post("/summarize/ab")
-async def summarize_ab(request: PromptRequest):
+async def summarize_ab(request: PromptRequest, raw_request: Request):
     """Run the same input through two different prompts for A/B comparison."""
     if not FEATURE_FLAGS.get("summarize", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
     if not FEATURE_FLAGS.get("ab_testing", False):
         raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
 
+    session_id = raw_request.headers.get("x-session-id")
     prompt_a_text = get_mlflow_prompt("summarize")
     prompt_b_text = config["summarize"].get("prompt_b")
     if not prompt_b_text:
@@ -381,10 +412,15 @@ async def summarize_ab(request: PromptRequest):
 
     q = queue.Queue()
 
+    @mlflow.trace(name="summarize_ab")
     def ab_worker(variant, sys_prompt):
         """Run inference for one variant and tag chunks."""
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id, "model": model, "variant": variant},
+            tags={"mlflow.trace.session": session_id},
+        )
         try:
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -486,7 +522,7 @@ async def list_ab_feedback():
 
 
 @app.post("/summarize")
-async def summarize(request: PromptRequest):
+async def summarize(request: PromptRequest, raw_request: Request):
     # Check if summarization feature is enabled
     if not FEATURE_FLAGS.get("summarize", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
@@ -495,11 +531,17 @@ async def summarize(request: PromptRequest):
     temperature = config["summarize"].get("temperature", 0.7)
     max_tokens = config["summarize"].get("max_tokens", 4096)
     model = config["summarize"]["model"]
+    session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
+    @mlflow.trace(name="summarize_with_shields")
     def worker_with_shields():
         """Use Responses API when shields are enabled - guardrails handled server-side."""
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id, "model": model, "prompt": request.prompt},
+            tags={"mlflow.trace.session": session_id},
+        )
         print(f"sending request to model {model} with shields (Responses API)")
         try:
             input_shields = SHIELDS_CONFIG.get("input_shields", [])
@@ -571,11 +613,16 @@ async def summarize(request: PromptRequest):
         finally:
             q.put(None)
 
+    @mlflow.trace(name="summarize_without_shields")
     def worker_without_shields():
         """Use direct inference API when shields are disabled."""
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id, "model": model, "prompt": request.prompt},
+            tags={"mlflow.trace.session": session_id},
+        )
         print(f"sending request to model {model} without shields (Inference API)")
         try:
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -583,7 +630,7 @@ async def summarize(request: PromptRequest):
                 ],
                 max_tokens=max_tokens,
                 temperature=temperature,
-                stream=True,
+                stream=False,
             )
 
             for r in response:
@@ -614,7 +661,7 @@ async def summarize(request: PromptRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/summarize/chat")
-async def summarize_chat(request: ChatRequest):
+async def summarize_chat(request: ChatRequest, raw_request: Request):
     """Chat endpoint for summarization with conversation history."""
     if not FEATURE_FLAGS.get("summarize", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
@@ -623,14 +670,20 @@ async def summarize_chat(request: ChatRequest):
     temperature = config["summarize"].get("temperature", 0.7)
     max_tokens = config["summarize"].get("max_tokens", 4096)
     model = config["summarize"]["model"]
+    session_id = raw_request.headers.get("x-session-id") or request.session_id
 
     # Convert ChatMessage objects to dict format for the LLM
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
     q = queue.Queue()
 
+    @mlflow.trace(name="summarize_chat_with_shields")
     def worker_with_shields():
         """Use Responses API when shields are enabled."""
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id, "model": model},
+            tags={"mlflow.trace.session": session_id},
+        )
         print(f"sending chat request to model {model} with shields (Responses API)")
         try:
             input_shields = SHIELDS_CONFIG.get("input_shields", [])
@@ -685,14 +738,23 @@ async def summarize_chat(request: ChatRequest):
         finally:
             q.put(None)
 
+    @mlflow.trace(name="summarize_chat_without_shields")
     def worker_without_shields():
         """Use direct inference API when shields are disabled."""
+        span = mlflow.get_current_active_span()
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        span.set_inputs(user_msgs[-1]["content"] if user_msgs else "")
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id, "model": model},
+            tags={"mlflow.trace.session": session_id},
+        )
         print(f"sending chat request to model {model} without shields (Inference API)")
+        full_response = ""
         try:
             # Prepend system message
             full_messages = [{"role": "system", "content": sys_prompt}] + messages
 
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=model,
                 messages=full_messages,
                 max_tokens=max_tokens,
@@ -704,12 +766,14 @@ async def summarize_chat(request: ChatRequest):
                 if hasattr(r, 'choices') and r.choices:
                     delta = r.choices[0].delta
                     if delta.content:
+                        full_response += delta.content
                         chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
                         q.put(chunk)
 
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
+            span.set_outputs(full_response)
             q.put(None)
 
     # Choose worker based on shields feature flag
@@ -728,7 +792,7 @@ async def summarize_chat(request: ChatRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/socratic-tutor")
-async def socratic_tutor(request: PromptRequest):
+async def socratic_tutor(request: PromptRequest, raw_request: Request):
     # Check if socratic tutor feature is enabled
     if not FEATURE_FLAGS.get("socratic-tutor", False):
         raise HTTPException(status_code=404, detail="Socratic tutor feature is not enabled")
@@ -737,15 +801,18 @@ async def socratic_tutor(request: PromptRequest):
     temperature = config["socratic-tutor"].get("temperature", 0.9)
     max_tokens = config["socratic-tutor"].get("max_tokens", 1500)
     model = config["socratic-tutor"]["model"]
+    session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
+    @mlflow.trace(name="socratic_tutor")
     def worker():
-        print(f"sending request to model {model} for socratic tutoring")
-        print(f"sys_prompt: {sys_prompt}")
-        print(f"user_prompt: {request.prompt}")
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id, "model": model, "prompt": request.prompt},
+            tags={"mlflow.trace.session": session_id},
+        )
         try:
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -756,26 +823,16 @@ async def socratic_tutor(request: PromptRequest):
                 stream=True,
             )
 
-            print(f"[Socratic Tutor] Starting to iterate over response...")
             for r in response:
-                print(f"[Socratic Tutor] Got response chunk: {r}")
                 if hasattr(r, 'choices') and r.choices:
                     delta = r.choices[0].delta
-                    print(f"[Socratic Tutor] Delta: {delta}")
                     if delta.content:
-                        print(f"[Socratic Tutor] Delta content: {delta.content}")
                         chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
                         q.put(chunk)
-                    else:
-                        print(f"[Socratic Tutor] Delta has no content")
-                else:
-                    print(f"[Socratic Tutor] Response has no choices")
 
         except Exception as e:
-            print(f"[Socratic Tutor] Error: {str(e)}")
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
-            print(f"[Socratic Tutor] Worker done, sending None to queue")
             q.put(None)
 
     threading.Thread(target=worker).start()
@@ -790,16 +847,16 @@ async def socratic_tutor(request: PromptRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/information-search")
-async def information_search(request: PromptRequest):
+async def information_search(request: PromptRequest, raw_request: Request):
     # Check if information search feature is enabled
     if not FEATURE_FLAGS.get("information-search", False):
         raise HTTPException(status_code=404, detail="Information search feature is not enabled")
 
-    # Dummy information search implementation
     sys_prompt = get_mlflow_prompt("information-search")
     temperature = config["information-search"].get("temperature", 0.7)
     max_tokens = config["information-search"].get("max_tokens", 4096)
     vector_db_id = config["information-search"].get("vector_db_id", "latest")
+    session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
@@ -830,16 +887,20 @@ async def information_search(request: PromptRequest):
 
     Note: The context includes intelligently processed content with preserved tables, formulas, figures, and document structure."""
 
+    @mlflow.trace(name="information_search")
     def worker():
-        print(f"sending requestion to model {config['summarize']['model']}")
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id, "model": config["summarize"]["model"], "prompt": request.prompt},
+            tags={"mlflow.trace.session": session_id},
+        )
         try:
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=config["summarize"]["model"],
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": enhaned_prompt},
                 ],
-                max_tokens=max_tokens, 
+                max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
@@ -865,16 +926,22 @@ async def information_search(request: PromptRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/student-assistant")
-async def student_assistant_chat(request: PromptRequest):
+async def student_assistant_chat(request: PromptRequest, raw_request: Request):
     if not FEATURE_FLAGS.get("student-assistant", False):
         raise HTTPException(status_code=404, detail="Student assistant feature is not enabled")
 
     if not agent:
         raise HTTPException(status_code=500, detail="Student assistant not initialized")
 
+    session_id = raw_request.headers.get("x-session-id")
     q = queue.Queue()
 
+    @mlflow.trace(name="student_assistant")
     def worker():
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id, "prompt": request.prompt},
+            tags={"mlflow.trace.session": session_id},
+        )
         try:
             from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
             thread_id = str(int(random.random() * 1000000))

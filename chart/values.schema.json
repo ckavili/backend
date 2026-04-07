@@ -21,16 +21,6 @@
         "https://mlflow.apps.example.com/mlflow"
       ]
     },
-    "MLFLOW_PROMPT_VERSION": {
-      "type": "string",
-      "description": "MLflow prompt version to fetch (alias or number)",
-      "default": "latest",
-      "examples": [
-        "latest",
-        "1",
-        "2"
-      ]
-    },
     "summarize": {
       "type": "object",
       "description": "Configuration for summarization functionality",
@@ -71,6 +61,12 @@
           "type": "string",
           "description": "MLflow prompt registry name for this feature",
           "examples": ["summarization"]
+        },
+        "mlflow_prompt_version": {
+          "type": "string",
+          "description": "MLflow prompt version for this feature (alias or number)",
+          "default": "latest",
+          "examples": ["latest", "1", "2"]
         }
       },
       "required": ["enabled"],
@@ -143,6 +139,12 @@
           "type": "string",
           "description": "MLflow prompt registry name for this feature",
           "examples": ["information-search"]
+        },
+        "mlflow_prompt_version": {
+          "type": "string",
+          "description": "MLflow prompt version for this feature (alias or number)",
+          "default": "latest",
+          "examples": ["latest", "1", "2"]
         }
       },
       "required": ["enabled"],
@@ -219,6 +221,12 @@
           "type": "string",
           "description": "MLflow prompt registry name for this feature",
           "examples": ["student-assistant"]
+        },
+        "mlflow_prompt_version": {
+          "type": "string",
+          "description": "MLflow prompt version for this feature (alias or number)",
+          "default": "latest",
+          "examples": ["latest", "1", "2"]
         }
       },
       "required": ["enabled"],
@@ -321,6 +329,12 @@
           "type": "string",
           "description": "MLflow prompt registry name for this feature",
           "examples": ["socratic-tutor"]
+        },
+        "mlflow_prompt_version": {
+          "type": "string",
+          "description": "MLflow prompt version for this feature (alias or number)",
+          "default": "latest",
+          "examples": ["latest", "1", "2"]
         }
       },
       "required": ["enabled"],
