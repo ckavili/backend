@@ -51,7 +51,9 @@ if os.path.exists(SA_TOKEN_PATH):
 
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 mlflow.set_experiment("canopy-backend")
-mlflow.openai.autolog() 
+mlflow.openai.autolog()
+mlflow.langchain.autolog()
+logging.getLogger("mlflow.langchain.langchain_tracer").setLevel(logging.ERROR)
 
 
 def get_mlflow_prompt(feature):
@@ -895,86 +897,69 @@ async def student_assistant_chat(request: PromptRequest, raw_request: Request):
     session_id = raw_request.headers.get("x-session-id")
     q = queue.Queue()
 
+    @mlflow.trace(name="student-assistant", span_type="AGENT")
+    def run_agent(prompt: str) -> str:
+        thread_id = session_id or str(int(random.random() * 1000000))
+        config_params = {"configurable": {"thread_id": thread_id}}
+        inputs = {"messages": [{"role": "user", "content": prompt}]}
+
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": thread_id},
+        )
+
+        result = agent.invoke(inputs, config_params)
+        messages = result.get("messages", [])
+
+        # Send intermediate steps (tool calls and results) to frontend
+        for msg in messages:
+            msg_type = getattr(msg, "type", None)
+
+            if msg_type == "ai" and getattr(msg, "tool_calls", None):
+                for tc in msg.tool_calls:
+                    tool_call_data = {
+                        "type": "tool_call",
+                        "name": tc.get("name"),
+                        "args": tc.get("args")
+                    }
+                    chunk = f"data: {json.dumps(tool_call_data)}\n\n"
+                    q.put(chunk)
+
+            elif msg_type == "tool":
+                tool_result_data = {
+                    "type": "tool_result",
+                    "name": msg.name,
+                    "content": str(msg.content)
+                }
+                chunk = f"data: {json.dumps(tool_result_data)}\n\n"
+                q.put(chunk)
+
+        # Extract and send final answer
+        final_answer = ""
+        if messages:
+            for msg in reversed(messages):
+                if getattr(msg, "type", None) == "ai" and not getattr(msg, "tool_calls", None):
+                    content = msg.content
+                    if isinstance(content, list):
+                        text_parts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                text_parts.append(part.get("text", ""))
+                        content = "".join(text_parts)
+
+                    if content:
+                        final_answer = content
+                        chunk = f"data: {json.dumps({'type': 'final_answer'})}\n\n"
+                        q.put(chunk)
+                        for char in content:
+                            chunk = f"data: {json.dumps({'delta': char})}\n\n"
+                            q.put(chunk)
+                    break
+
+        return final_answer
+
     def worker():
         try:
-            from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-            thread_id = str(int(random.random() * 1000000))
-            config_params = {"configurable": {"thread_id": thread_id}}
-            inputs = {"messages": [HumanMessage(content=request.prompt)]}
-
-            seen_messages = 0
-            seen_tool_calls = set()  # Track which tool calls we've already sent
-
-            for state in agent.stream(inputs, config_params, stream_mode="values"):
-                messages = state.get("messages", [])
-                new_messages = messages[seen_messages:]
-                seen_messages = len(messages)
-
-                for msg in new_messages:
-                    msg_type = getattr(msg, "type", None)
-
-                    if msg_type == "ai":
-                        # Check for tool calls
-                        if getattr(msg, "tool_calls", None):
-                            for tc in msg.tool_calls:
-                                # Create unique identifier for this tool call
-                                tool_call_id = f"{tc.get('name')}:{json.dumps(tc.get('args'), sort_keys=True)}"
-                                if tool_call_id not in seen_tool_calls:
-                                    seen_tool_calls.add(tool_call_id)
-                                    tool_call_data = {
-                                        "type": "tool_call",
-                                        "name": tc.get("name"),
-                                        "args": tc.get("args")
-                                    }
-                                    chunk = f"data: {json.dumps(tool_call_data)}\n\n"
-                                    q.put(chunk)
-                        else:
-                            # Check for MCP tool outputs
-                            tool_outputs = msg.additional_kwargs.get("tool_outputs", [])
-                            for t in tool_outputs:
-                                if t.get("type") == "mcp_call":
-                                    mcp_data = {
-                                        "type": "mcp_call",
-                                        "name": t.get("name"),
-                                        "server_label": t.get("server_label"),
-                                        "arguments": t.get("arguments"),
-                                        "output": t.get("output", ""),
-                                        "error": t.get("error", "")
-                                    }
-                                    chunk = f"data: {json.dumps(mcp_data)}\n\n"
-                                    q.put(chunk)
-
-                    elif msg_type == "tool":
-                        # Tool result
-                        tool_result_data = {
-                            "type": "tool_result",
-                            "name": msg.name,
-                            "content": str(msg.content)  # Show more content
-                        }
-                        chunk = f"data: {json.dumps(tool_result_data)}\n\n"
-                        q.put(chunk)
-
-            # After streaming all intermediate steps, send the final answer
-            if messages:
-                for msg in reversed(messages):
-                    if getattr(msg, "type", None) == "ai":
-                        content = msg.content
-                        if isinstance(content, list):
-                            text_parts = []
-                            for part in content:
-                                if isinstance(part, dict) and part.get("type") == "text":
-                                    text_parts.append(part.get("text", ""))
-                            content = "".join(text_parts)
-
-                        if content:
-                            # Send final answer marker
-                            chunk = f"data: {json.dumps({'type': 'final_answer'})}\n\n"
-                            q.put(chunk)
-                            # Stream the final answer character by character
-                            for char in content:
-                                chunk = f"data: {json.dumps({'delta': char})}\n\n"
-                                q.put(chunk)
-                        break
+            run_agent(request.prompt)
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
