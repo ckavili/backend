@@ -1,1 +1,2 @@
 LLAMA_STACK_URL: "http://llama-stack-service:8321"
+MLFLOW_TRACKING_URI: "https://mlflow.redhat-ods-applications.svc.cluster.local:8443"

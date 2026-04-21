@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from llama_stack_client import LlamaStackClient
+from openai import OpenAI
 import os
 import asyncio
 import json
@@ -16,8 +17,65 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 import random
+import mlflow
 
 app = FastAPI(title="Canopy Backend API")
+
+# MLflow prompt registry configuration
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "https://mlflow.redhat-ods-applications.svc.cluster.local:8443")
+if not os.getenv("MLFLOW_TRACKING_AUTH"):
+    os.environ["MLFLOW_TRACKING_AUTH"] = "kubernetes"
+if not os.getenv("MLFLOW_TRACKING_INSECURE_TLS"):
+    os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"
+
+NAMESPACE_PATH = "/run/secrets/kubernetes.io/serviceaccount/namespace"
+APP_NAMESPACE = os.getenv("MLFLOW_WORKSPACE")
+TOOLINGS_NAMESPACE = os.getenv("MLFLOW_PROMPT_WORKSPACE")
+
+if not APP_NAMESPACE and os.path.exists(NAMESPACE_PATH):
+    with open(NAMESPACE_PATH) as f:
+        APP_NAMESPACE = f.read().strip()
+
+if APP_NAMESPACE:
+    os.environ["MLFLOW_WORKSPACE"] = APP_NAMESPACE
+    if not TOOLINGS_NAMESPACE:
+        # Prompts live in the toolings namespace (e.g. userX-toolings),
+        # while the backend runs in userX-test or userX-prod
+        user_prefix = APP_NAMESPACE.rsplit("-", 1)[0]
+        TOOLINGS_NAMESPACE = f"{user_prefix}-toolings"
+
+SA_TOKEN_PATH = "/run/secrets/kubernetes.io/serviceaccount/token"
+if os.path.exists(SA_TOKEN_PATH):
+    with open(SA_TOKEN_PATH) as f:
+        os.environ["MLFLOW_TRACKING_TOKEN"] = f.read().strip()
+
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.set_experiment("canopy-backend")
+mlflow.openai.autolog()
+mlflow.langchain.autolog()
+logging.getLogger("mlflow.langchain.langchain_tracer").setLevel(logging.ERROR)
+
+
+def get_mlflow_prompt(feature):
+    """Fetch system prompt from MLflow prompt registry for a given feature.
+
+    Temporarily switches to the toolings workspace to load prompts,
+    then switches back to the app's own workspace for experiment tracking.
+    """
+    prompt_name = config[feature]["mlflow_prompt"]
+    version = config[feature].get("mlflow_prompt_version", "latest")
+    original_workspace = os.environ.get("MLFLOW_WORKSPACE")
+    try:
+        if TOOLINGS_NAMESPACE:
+            os.environ["MLFLOW_WORKSPACE"] = TOOLINGS_NAMESPACE
+        if version == "latest":
+            prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}@{version}")
+        else:
+            prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}/{version}")
+    finally:
+        if original_workspace:
+            os.environ["MLFLOW_WORKSPACE"] = original_workspace
+    return prompt.template
 
 # Load configuration with fallback for testing
 config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
@@ -26,6 +84,7 @@ if os.path.exists(config_path):
         config = yaml.safe_load(f)
 
     llama_client = LlamaStackClient(base_url=config["LLAMA_STACK_URL"])
+    openai_client = OpenAI(base_url=config["LLAMA_STACK_URL"] + "/v1", api_key="no-key-required")
 
     # Feature flags configuration from environment variables
     FEATURE_FLAGS = {
@@ -51,6 +110,7 @@ else:
     # Fallback for testing - config will be loaded by tests
     config = None
     llama_client = None
+    openai_client = None
     FEATURE_FLAGS = {
         "information-search": False,
         "summarize": False,
@@ -172,7 +232,7 @@ if FEATURE_FLAGS.get("student-assistant", False):
     )
 
     # Evaluate the prompt as an f-string to execute any Python expressions in {}
-    prompt_template = config["student-assistant"].get("prompt", "You are a helpful university assistant.")
+    prompt_template = get_mlflow_prompt("student-assistant")
     formatted_prompt = eval(f'f"""{prompt_template}"""')
 
     agent = create_react_agent(
@@ -323,14 +383,15 @@ async def export_feedback_for_eval():
 
 
 @app.post("/summarize/ab")
-async def summarize_ab(request: PromptRequest):
+async def summarize_ab(request: PromptRequest, raw_request: Request):
     """Run the same input through two different prompts for A/B comparison."""
     if not FEATURE_FLAGS.get("summarize", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
     if not FEATURE_FLAGS.get("ab_testing", False):
         raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
 
-    prompt_a_text = config["summarize"].get("prompt", "Summarize the following text:")
+    session_id = raw_request.headers.get("x-session-id")
+    prompt_a_text = get_mlflow_prompt("summarize")
     prompt_b_text = config["summarize"].get("prompt_b")
     if not prompt_b_text:
         raise HTTPException(status_code=400, detail="prompt_b is not configured in summarize config")
@@ -349,7 +410,7 @@ async def summarize_ab(request: PromptRequest):
     def ab_worker(variant, sys_prompt):
         """Run inference for one variant and tag chunks."""
         try:
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -451,15 +512,16 @@ async def list_ab_feedback():
 
 
 @app.post("/summarize")
-async def summarize(request: PromptRequest):
+async def summarize(request: PromptRequest, raw_request: Request):
     # Check if summarization feature is enabled
     if not FEATURE_FLAGS.get("summarize", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
 
-    sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
+    sys_prompt = get_mlflow_prompt("summarize")
     temperature = config["summarize"].get("temperature", 0.7)
     max_tokens = config["summarize"].get("max_tokens", 4096)
     model = config["summarize"]["model"]
+    session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
@@ -536,38 +598,43 @@ async def summarize(request: PromptRequest):
         finally:
             q.put(None)
 
-    def worker_without_shields():
+    @mlflow.trace
+    def worker_without_shields(messages: list[dict], session_id: str):
         """Use direct inference API when shields are disabled."""
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id},
+        )
         print(f"sending request to model {model} without shields (Inference API)")
+        full_response = ""
         try:
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": request.prompt},
-                ],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
-
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
+            for chunk in response:
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
                     if delta.content:
-                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                        q.put(chunk)
-
+                        full_response += delta.content
+                        q.put(f"data: {json.dumps({'delta': delta.content})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
             q.put(None)
+        return full_response
 
     # Choose worker based on shields feature flag
     if FEATURE_FLAGS.get("shields", False):
         threading.Thread(target=worker_with_shields).start()
     else:
-        threading.Thread(target=worker_without_shields).start()
+        summarize_messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": request.prompt},
+        ]
+        threading.Thread(target=worker_without_shields, args=(summarize_messages, session_id)).start()
 
     async def streamer():
         while True:
@@ -579,15 +646,16 @@ async def summarize(request: PromptRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/summarize/chat")
-async def summarize_chat(request: ChatRequest):
+async def summarize_chat(request: ChatRequest, raw_request: Request):
     """Chat endpoint for summarization with conversation history."""
     if not FEATURE_FLAGS.get("summarize", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
 
-    sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
+    sys_prompt = get_mlflow_prompt("summarize")
     temperature = config["summarize"].get("temperature", 0.7)
     max_tokens = config["summarize"].get("max_tokens", 4096)
     model = config["summarize"]["model"]
+    session_id = raw_request.headers.get("x-session-id") or request.session_id
 
     # Convert ChatMessage objects to dict format for the LLM
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
@@ -650,38 +718,40 @@ async def summarize_chat(request: ChatRequest):
         finally:
             q.put(None)
 
-    def worker_without_shields():
+    @mlflow.trace
+    def worker_without_shields(messages: list[dict], session_id: str):
         """Use direct inference API when shields are disabled."""
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id},
+        )
         print(f"sending chat request to model {model} without shields (Inference API)")
+        full_response = ""
         try:
-            # Prepend system message
-            full_messages = [{"role": "system", "content": sys_prompt}] + messages
-
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=model,
-                messages=full_messages,
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
-
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
+            for chunk in response:
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
                     if delta.content:
-                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                        q.put(chunk)
-
+                        full_response += delta.content
+                        q.put(f"data: {json.dumps({'delta': delta.content})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
             q.put(None)
+        return full_response
 
     # Choose worker based on shields feature flag
     if FEATURE_FLAGS.get("shields", False):
         threading.Thread(target=worker_with_shields).start()
     else:
-        threading.Thread(target=worker_without_shields).start()
+        full_messages = [{"role": "system", "content": sys_prompt}] + messages
+        threading.Thread(target=worker_without_shields, args=(full_messages, session_id)).start()
 
     async def streamer():
         while True:
@@ -693,24 +763,22 @@ async def summarize_chat(request: ChatRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/socratic-tutor")
-async def socratic_tutor(request: PromptRequest):
+async def socratic_tutor(request: PromptRequest, raw_request: Request):
     # Check if socratic tutor feature is enabled
     if not FEATURE_FLAGS.get("socratic-tutor", False):
         raise HTTPException(status_code=404, detail="Socratic tutor feature is not enabled")
 
-    sys_prompt = config["socratic-tutor"].get("prompt", "Help the student discover the answer through questioning:")
+    sys_prompt = get_mlflow_prompt("socratic-tutor")
     temperature = config["socratic-tutor"].get("temperature", 0.9)
     max_tokens = config["socratic-tutor"].get("max_tokens", 1500)
     model = config["socratic-tutor"]["model"]
+    session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
     def worker():
-        print(f"sending request to model {model} for socratic tutoring")
-        print(f"sys_prompt: {sys_prompt}")
-        print(f"user_prompt: {request.prompt}")
         try:
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -721,26 +789,16 @@ async def socratic_tutor(request: PromptRequest):
                 stream=True,
             )
 
-            print(f"[Socratic Tutor] Starting to iterate over response...")
             for r in response:
-                print(f"[Socratic Tutor] Got response chunk: {r}")
                 if hasattr(r, 'choices') and r.choices:
                     delta = r.choices[0].delta
-                    print(f"[Socratic Tutor] Delta: {delta}")
                     if delta.content:
-                        print(f"[Socratic Tutor] Delta content: {delta.content}")
                         chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
                         q.put(chunk)
-                    else:
-                        print(f"[Socratic Tutor] Delta has no content")
-                else:
-                    print(f"[Socratic Tutor] Response has no choices")
 
         except Exception as e:
-            print(f"[Socratic Tutor] Error: {str(e)}")
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
-            print(f"[Socratic Tutor] Worker done, sending None to queue")
             q.put(None)
 
     threading.Thread(target=worker).start()
@@ -755,16 +813,16 @@ async def socratic_tutor(request: PromptRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/information-search")
-async def information_search(request: PromptRequest):
+async def information_search(request: PromptRequest, raw_request: Request):
     # Check if information search feature is enabled
     if not FEATURE_FLAGS.get("information-search", False):
         raise HTTPException(status_code=404, detail="Information search feature is not enabled")
 
-    # Dummy information search implementation
-    sys_prompt = config["information-search"]["prompt"]
+    sys_prompt = get_mlflow_prompt("information-search")
     temperature = config["information-search"].get("temperature", 0.7)
     max_tokens = config["information-search"].get("max_tokens", 4096)
     vector_db_id = config["information-search"].get("vector_db_id", "latest")
+    session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
@@ -796,15 +854,14 @@ async def information_search(request: PromptRequest):
     Note: The context includes intelligently processed content with preserved tables, formulas, figures, and document structure."""
 
     def worker():
-        print(f"sending requestion to model {config['summarize']['model']}")
         try:
-            response = llama_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=config["summarize"]["model"],
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": enhaned_prompt},
                 ],
-                max_tokens=max_tokens, 
+                max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
@@ -830,95 +887,79 @@ async def information_search(request: PromptRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/student-assistant")
-async def student_assistant_chat(request: PromptRequest):
+async def student_assistant_chat(request: PromptRequest, raw_request: Request):
     if not FEATURE_FLAGS.get("student-assistant", False):
         raise HTTPException(status_code=404, detail="Student assistant feature is not enabled")
 
     if not agent:
         raise HTTPException(status_code=500, detail="Student assistant not initialized")
 
+    session_id = raw_request.headers.get("x-session-id")
     q = queue.Queue()
+
+    @mlflow.trace(name="student-assistant", span_type="AGENT")
+    def run_agent(prompt: str) -> str:
+        thread_id = session_id or str(int(random.random() * 1000000))
+        config_params = {"configurable": {"thread_id": thread_id}}
+        inputs = {"messages": [{"role": "user", "content": prompt}]}
+
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": thread_id},
+        )
+
+        result = agent.invoke(inputs, config_params)
+        messages = result.get("messages", [])
+
+        # Send intermediate steps (tool calls and results) to frontend
+        for msg in messages:
+            msg_type = getattr(msg, "type", None)
+
+            if msg_type == "ai" and getattr(msg, "tool_calls", None):
+                for tc in msg.tool_calls:
+                    tool_call_data = {
+                        "type": "tool_call",
+                        "name": tc.get("name"),
+                        "args": tc.get("args")
+                    }
+                    chunk = f"data: {json.dumps(tool_call_data)}\n\n"
+                    q.put(chunk)
+
+            elif msg_type == "tool":
+                tool_result_data = {
+                    "type": "tool_result",
+                    "name": msg.name,
+                    "content": str(msg.content)
+                }
+                chunk = f"data: {json.dumps(tool_result_data)}\n\n"
+                q.put(chunk)
+
+        # Extract and send final answer
+        final_answer = ""
+        if messages:
+            for msg in reversed(messages):
+                if getattr(msg, "type", None) == "ai" and not getattr(msg, "tool_calls", None):
+                    content = msg.content
+                    if isinstance(content, list):
+                        text_parts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                text_parts.append(part.get("text", ""))
+                        content = "".join(text_parts)
+
+                    if content:
+                        final_answer = content
+                        chunk = f"data: {json.dumps({'type': 'final_answer'})}\n\n"
+                        q.put(chunk)
+                        for char in content:
+                            chunk = f"data: {json.dumps({'delta': char})}\n\n"
+                            q.put(chunk)
+                    break
+
+        return final_answer
 
     def worker():
         try:
-            from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-            thread_id = str(int(random.random() * 1000000))
-            config_params = {"configurable": {"thread_id": thread_id}}
-            inputs = {"messages": [HumanMessage(content=request.prompt)]}
-
-            seen_messages = 0
-            seen_tool_calls = set()  # Track which tool calls we've already sent
-
-            for state in agent.stream(inputs, config_params, stream_mode="values"):
-                messages = state.get("messages", [])
-                new_messages = messages[seen_messages:]
-                seen_messages = len(messages)
-
-                for msg in new_messages:
-                    msg_type = getattr(msg, "type", None)
-
-                    if msg_type == "ai":
-                        # Check for tool calls
-                        if getattr(msg, "tool_calls", None):
-                            for tc in msg.tool_calls:
-                                # Create unique identifier for this tool call
-                                tool_call_id = f"{tc.get('name')}:{json.dumps(tc.get('args'), sort_keys=True)}"
-                                if tool_call_id not in seen_tool_calls:
-                                    seen_tool_calls.add(tool_call_id)
-                                    tool_call_data = {
-                                        "type": "tool_call",
-                                        "name": tc.get("name"),
-                                        "args": tc.get("args")
-                                    }
-                                    chunk = f"data: {json.dumps(tool_call_data)}\n\n"
-                                    q.put(chunk)
-                        else:
-                            # Check for MCP tool outputs
-                            tool_outputs = msg.additional_kwargs.get("tool_outputs", [])
-                            for t in tool_outputs:
-                                if t.get("type") == "mcp_call":
-                                    mcp_data = {
-                                        "type": "mcp_call",
-                                        "name": t.get("name"),
-                                        "server_label": t.get("server_label"),
-                                        "arguments": t.get("arguments"),
-                                        "output": t.get("output", ""),
-                                        "error": t.get("error", "")
-                                    }
-                                    chunk = f"data: {json.dumps(mcp_data)}\n\n"
-                                    q.put(chunk)
-
-                    elif msg_type == "tool":
-                        # Tool result
-                        tool_result_data = {
-                            "type": "tool_result",
-                            "name": msg.name,
-                            "content": str(msg.content)  # Show more content
-                        }
-                        chunk = f"data: {json.dumps(tool_result_data)}\n\n"
-                        q.put(chunk)
-
-            # After streaming all intermediate steps, send the final answer
-            if messages:
-                for msg in reversed(messages):
-                    if getattr(msg, "type", None) == "ai":
-                        content = msg.content
-                        if isinstance(content, list):
-                            text_parts = []
-                            for part in content:
-                                if isinstance(part, dict) and part.get("type") == "text":
-                                    text_parts.append(part.get("text", ""))
-                            content = "".join(text_parts)
-
-                        if content:
-                            # Send final answer marker
-                            chunk = f"data: {json.dumps({'type': 'final_answer'})}\n\n"
-                            q.put(chunk)
-                            # Stream the final answer character by character
-                            for char in content:
-                                chunk = f"data: {json.dumps({'delta': char})}\n\n"
-                                q.put(chunk)
-                        break
+            run_agent(request.prompt)
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
