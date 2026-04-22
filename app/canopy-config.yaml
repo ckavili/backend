@@ -1,8 +1,8 @@
 
-LLAMA_STACK_URL: "http://llamastack-user1-canopy.apps.cluster-sd7hw.sd7hw.sandbox5218.opentlc.com"
 summarize:
   enabled: true
-  model: vllm-llama32/llama32
+  endpoint: "http://llama-32-predictor.ai501.svc.cluster.local:80/v1"
+  model: llama32
   temperature: 0.9
   max_tokens: 4096
   prompt: |
