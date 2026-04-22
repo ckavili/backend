@@ -85,6 +85,8 @@ if os.path.exists(config_path):
 
     llama_client = LlamaStackClient(base_url=config["LLAMA_STACK_URL"])
     openai_client = OpenAI(base_url=config["LLAMA_STACK_URL"] + "/v1", api_key="no-key-required")
+    model_endpoint_url = os.getenv("MODEL_ENDPOINT_URL", config.get("MODEL_ENDPOINT_URL", config["LLAMA_STACK_URL"] + "/v1"))
+    model_client = OpenAI(base_url=model_endpoint_url, api_key="no-key-required")
 
     # Feature flags configuration from environment variables
     FEATURE_FLAGS = {
@@ -111,6 +113,7 @@ else:
     config = None
     llama_client = None
     openai_client = None
+    model_client = None
     FEATURE_FLAGS = {
         "information-search": False,
         "summarize": False,
@@ -525,89 +528,15 @@ async def summarize(request: PromptRequest, raw_request: Request):
 
     q = queue.Queue()
 
-    def worker_with_shields():
-        """Use Responses API when shields are enabled - guardrails handled server-side."""
-        print(f"sending request to model {model} with shields (Responses API)")
-        try:
-            input_shields = SHIELDS_CONFIG.get("input_shields", [])
-            output_shields = SHIELDS_CONFIG.get("output_shields", [])
-            # Combine input and output shields for guardrails
-            guardrails = list(set(input_shields + output_shields))
-
-            # Use Responses API with guardrails
-            response = llama_client.responses.create(
-                model=model,
-                instructions=sys_prompt,
-                input=[{"role": "user", "content": request.prompt, "type": "message"}],
-                temperature=temperature,
-                stream=True,
-                extra_body={"guardrails": guardrails} if guardrails else None,
-            )
-
-            for event in response:
-                # Handle different event types
-                event_type = getattr(event, 'type', None)
-                print(f"[Responses API] Event type: {event_type}")
-                print(f"[Responses API] Event: {event}")
-
-                # Handle text delta streaming
-                if event_type == 'response.output_text.delta':
-                    delta_text = getattr(event, 'delta', '')
-                    if delta_text:
-                        print(f"[Responses API] Delta: {delta_text}")
-                        chunk = f"data: {json.dumps({'delta': delta_text})}\n\n"
-                        q.put(chunk)
-
-                # Handle response failure (includes guardrail violations)
-                elif event_type == 'response.failed':
-                    error_msg = 'Response generation failed'
-                    if hasattr(event, 'response') and hasattr(event.response, 'error'):
-                        error_msg = getattr(event.response.error, 'message', error_msg)
-                    print(f"[Responses API] Failed: {error_msg}")
-                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                    q.put(chunk)
-                    break
-
-                # Handle completed response
-                elif event_type == 'response.completed':
-                    print(f"[Responses API] Completed")
-                    if hasattr(event, 'response'):
-                        resp = event.response
-                        # Check for refusal in output (guardrail violation)
-                        if hasattr(resp, 'output') and resp.output:
-                            for output_msg in resp.output:
-                                if hasattr(output_msg, 'content') and output_msg.content:
-                                    for content_item in output_msg.content:
-                                        if isinstance(content_item, dict) and content_item.get('type') == 'refusal':
-                                            error_msg = "Your request was blocked by our safety guardrails"
-                                            print(f"[Responses API] Guardrail refusal detected")
-                                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                                            q.put(chunk)
-                                            return
-                        # Check if response has error status
-                        if hasattr(resp, 'status') and resp.status == 'failed':
-                            error_msg = 'Content blocked by safety guardrails'
-                            if hasattr(resp, 'error') and resp.error:
-                                error_msg = getattr(resp.error, 'message', error_msg)
-                            print(f"[Responses API] Guardrail violation: {error_msg}")
-                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                            q.put(chunk)
-
-        except Exception as e:
-            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
-        finally:
-            q.put(None)
-
     @mlflow.trace
-    def worker_without_shields(messages: list[dict], session_id: str):
-        """Use direct inference API when shields are disabled."""
+    def worker(messages: list[dict], session_id: str):
         mlflow.update_current_trace(
             metadata={"mlflow.trace.session": session_id},
         )
-        print(f"sending request to model {model} without shields (Inference API)")
+        print(f"sending request to model {model} (direct model endpoint)")
         full_response = ""
         try:
-            response = openai_client.chat.completions.create(
+            response = model_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -626,15 +555,11 @@ async def summarize(request: PromptRequest, raw_request: Request):
             q.put(None)
         return full_response
 
-    # Choose worker based on shields feature flag
-    if FEATURE_FLAGS.get("shields", False):
-        threading.Thread(target=worker_with_shields).start()
-    else:
-        summarize_messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": request.prompt},
-        ]
-        threading.Thread(target=worker_without_shields, args=(summarize_messages, session_id)).start()
+    summarize_messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": request.prompt},
+    ]
+    threading.Thread(target=worker, args=(summarize_messages, session_id)).start()
 
     async def streamer():
         while True:
