@@ -41,23 +41,13 @@
             "llama3.2"
           ]
         },
-        "prompt": {
-          "type": "string",
-          "description": "Prompt template for summarization requests",
-          "minLength": 1
-        },
-        "max_tokens": {
-          "type": "number",
-          "description": "Max tokens for the model"
-        },
         "temperature": {
           "type": "number",
           "description": "Temperature for the model"
         },
-        "prompt_b": {
-          "type": "string",
-          "description": "Alternative prompt for A/B testing",
-          "minLength": 1
+        "max_tokens": {
+          "type": "number",
+          "description": "Max tokens for the model"
         },
         "mlflow_prompt": {
           "type": "string",
@@ -99,40 +89,13 @@
             "llama3.2"
           ]
         },
-        "prompt": {
-          "type": "string",
-          "description": "System prompt for information search requests",
-          "minLength": 1
-        },
-        "vector_db_id": {
-          "type": "string",
-          "description": "Vector database identifier to use for information search",
-          "minLength": 1,
-          "examples": [
-            "latest",
-            "v1.0",
-            "production"
-          ]
-        },
-        "max_tokens": {
-          "type": "number",
-          "description": "Max tokens for the model"
-        },
         "temperature": {
           "type": "number",
           "description": "Temperature for the model"
         },
-        "chart_path": {
-          "type": "string",
-          "description": "Target namespace for deployment (format: userX-environment)"
-        },
-        "repo_url": {
-          "type": "string",
-          "description": "Repository URL for the Helm chart"
-        },
-        "target_revision": {
-          "type": "string",
-          "description": "Target Revision for the Helm chart"
+        "max_tokens": {
+          "type": "number",
+          "description": "Max tokens for the model"
         },
         "mlflow_prompt": {
           "type": "string",
@@ -144,6 +107,20 @@
           "description": "MLflow prompt version for this feature (alias or number)",
           "default": "latest",
           "examples": ["latest", "1", "2"]
+        },
+        "vector_db_id": {
+          "type": "string",
+          "description": "Vector database identifier to use for information search",
+          "minLength": 1,
+          "examples": [
+            "latest",
+            "v1.0",
+            "production"
+          ]
+        },
+        "repo_url": {
+          "type": "string",
+          "description": "Repository URL for the Helm chart"
         }
       },
       "required": ["enabled"],
@@ -208,44 +185,13 @@
             "llama3.2"
           ]
         },
-        "prompt": {
-          "type": "string",
-          "description": "System prompt for student assistant requests",
-          "minLength": 1
-        },
-        "vector_db_id": {
-          "type": "string",
-          "description": "Vector database identifier to use for knowledge base search",
-          "minLength": 1,
-          "examples": [
-            "latest",
-            "v1.0",
-            "production"
-          ]
-        },
-        "max_tokens": {
-          "type": "number",
-          "description": "Max tokens for the model"
-        },
-        "mcp_calendar_url": {
-          "type": "string",
-          "description": "URL for the MCP calendar server"
-        },
         "temperature": {
           "type": "number",
           "description": "Temperature for the model"
         },
-        "chart_path": {
-          "type": "string",
-          "description": "Target namespace for deployment (format: userX-environment)"
-        },
-        "repo_url": {
-          "type": "string",
-          "description": "Repository URL for the Helm chart"
-        },
-        "target_revision": {
-          "type": "string",
-          "description": "Target Revision for the Helm chart"
+        "max_tokens": {
+          "type": "number",
+          "description": "Max tokens for the model"
         },
         "mlflow_prompt": {
           "type": "string",
@@ -257,6 +203,20 @@
           "description": "MLflow prompt version for this feature (alias or number)",
           "default": "latest",
           "examples": ["latest", "1", "2"]
+        },
+        "vector_db_id": {
+          "type": "string",
+          "description": "Vector database identifier to use for knowledge base search",
+          "minLength": 1,
+          "examples": [
+            "latest",
+            "v1.0",
+            "production"
+          ]
+        },
+        "mcp_calendar_url": {
+          "type": "string",
+          "description": "URL for the MCP calendar server"
         }
       },
       "required": ["enabled"],
@@ -287,18 +247,13 @@
             "llama32-socratic"
           ]
         },
-        "prompt": {
-          "type": "string",
-          "description": "Prompt template for Socratic tutor requests",
-          "minLength": 1
+        "temperature": {
+          "type": "number",
+          "description": "Temperature for the model"
         },
         "max_tokens": {
           "type": "number",
           "description": "Max tokens for the model"
-        },
-        "temperature": {
-          "type": "number",
-          "description": "Temperature for the model"
         },
         "mlflow_prompt": {
           "type": "string",
