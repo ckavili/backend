@@ -39,10 +39,11 @@ if not APP_NAMESPACE and os.path.exists(NAMESPACE_PATH):
 if APP_NAMESPACE:
     os.environ["MLFLOW_WORKSPACE"] = APP_NAMESPACE
     if not TOOLINGS_NAMESPACE:
-        # Prompts live in the toolings namespace (e.g. userX-toolings),
-        # while the backend runs in userX-test or userX-prod
-        user_prefix = APP_NAMESPACE.rsplit("-", 1)[0]
-        TOOLINGS_NAMESPACE = f"{user_prefix}-toolings"
+        if APP_NAMESPACE.endswith(("-test", "-prod")):
+            user_prefix = APP_NAMESPACE.rsplit("-", 1)[0]
+            TOOLINGS_NAMESPACE = f"{user_prefix}-toolings"
+        else:
+            TOOLINGS_NAMESPACE = APP_NAMESPACE
 
 SA_TOKEN_PATH = "/run/secrets/kubernetes.io/serviceaccount/token"
 if os.path.exists(SA_TOKEN_PATH):
@@ -83,10 +84,19 @@ if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    llama_client = LlamaStackClient(base_url=config["LLAMA_STACK_URL"])
-    openai_client = OpenAI(base_url=config["LLAMA_STACK_URL"] + "/v1", api_key="no-key-required")
-    model_endpoint_url = os.getenv("MODEL_ENDPOINT_URL", config.get("MODEL_ENDPOINT_URL", config["LLAMA_STACK_URL"] + "/v1"))
-    model_client = OpenAI(base_url=model_endpoint_url, api_key="no-key-required")
+    _openai_clients = {}
+    def get_openai_client(feature):
+        endpoint = config[feature]["endpoint"]
+        if endpoint not in _openai_clients:
+            _openai_clients[endpoint] = OpenAI(base_url=endpoint, api_key="no-key-required")
+        return _openai_clients[endpoint]
+
+    _llama_clients = {}
+    def get_llama_client(feature):
+        endpoint = config[feature]["endpoint"]
+        if endpoint not in _llama_clients:
+            _llama_clients[endpoint] = LlamaStackClient(base_url=endpoint)
+        return _llama_clients[endpoint]
 
     # Feature flags configuration from environment variables
     FEATURE_FLAGS = {
@@ -111,9 +121,8 @@ if os.path.exists(config_path):
 else:
     # Fallback for testing - config will be loaded by tests
     config = None
-    llama_client = None
-    openai_client = None
-    model_client = None
+    def get_openai_client(feature): return None
+    def get_llama_client(feature): return None
     FEATURE_FLAGS = {
         "information-search": False,
         "summarize": False,
@@ -215,7 +224,7 @@ if FEATURE_FLAGS.get("student-assistant", False):
     vector_store_id = config["student-assistant"].get("vector_db_id", "latest")
 
     # Create tools using factory function
-    student_tools = create_student_tools(llama_client, vector_store_id)
+    student_tools = create_student_tools(get_llama_client("student-assistant"), vector_store_id)
 
     tools = student_tools + [
         {
@@ -227,7 +236,7 @@ if FEATURE_FLAGS.get("student-assistant", False):
     ]
 
     llm = ChatOpenAI(
-        openai_api_base=config["LLAMA_STACK_URL"] + "/v1",
+        openai_api_base=config["student-assistant"]["endpoint"],
         model=config["student-assistant"]["model"],
         openai_api_key="not-needed",
         use_responses_api=True,
@@ -413,7 +422,7 @@ async def summarize_ab(request: PromptRequest, raw_request: Request):
     def ab_worker(variant, sys_prompt):
         """Run inference for one variant and tag chunks."""
         try:
-            response = openai_client.chat.completions.create(
+            response = get_openai_client("summarize").chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -536,7 +545,7 @@ async def summarize(request: PromptRequest, raw_request: Request):
         print(f"sending request to model {model} (direct model endpoint)")
         full_response = ""
         try:
-            response = model_client.chat.completions.create(
+            response = get_openai_client("summarize").chat.completions.create(
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -598,7 +607,7 @@ async def summarize_chat(request: ChatRequest, raw_request: Request):
             # Convert messages to the responses API format
             input_messages = [{"role": msg["role"], "content": msg["content"], "type": "message"} for msg in messages]
 
-            response = llama_client.responses.create(
+            response = get_llama_client("shields").responses.create(
                 model=model,
                 instructions=sys_prompt,
                 input=input_messages,
@@ -652,7 +661,7 @@ async def summarize_chat(request: ChatRequest, raw_request: Request):
         print(f"sending chat request to model {model} without shields (Inference API)")
         full_response = ""
         try:
-            response = openai_client.chat.completions.create(
+            response = get_openai_client("summarize").chat.completions.create(
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -703,7 +712,7 @@ async def socratic_tutor(request: PromptRequest, raw_request: Request):
 
     def worker():
         try:
-            response = openai_client.chat.completions.create(
+            response = get_openai_client("socratic-tutor").chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -752,10 +761,10 @@ async def information_search(request: PromptRequest, raw_request: Request):
     q = queue.Queue()
 
     print(f"Searching in collection {vector_db_id}")
-    print(f"Existing collections: {llama_client.vector_stores.list()}")
+    print(f"Existing collections: {get_llama_client('information-search').vector_stores.list()}")
     print(f"query: {request.prompt}")
 
-    search_results = llama_client.vector_stores.search(
+    search_results = get_llama_client("information-search").vector_stores.search(
         vector_store_id=vector_db_id,
         query=request.prompt,
         max_num_results=5,
@@ -780,8 +789,8 @@ async def information_search(request: PromptRequest, raw_request: Request):
 
     def worker():
         try:
-            response = openai_client.chat.completions.create(
-                model=config["summarize"]["model"],
+            response = get_openai_client("information-search").chat.completions.create(
+                model=config["information-search"]["model"],
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": enhaned_prompt},
