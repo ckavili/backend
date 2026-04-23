@@ -69,10 +69,10 @@ def get_mlflow_prompt(feature):
     try:
         if TOOLINGS_NAMESPACE:
             os.environ["MLFLOW_WORKSPACE"] = TOOLINGS_NAMESPACE
-        if version == "latest":
-            prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}@{version}")
-        else:
+        if version.isdigit():
             prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}/{version}")
+        else:
+            prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}@{version}")
     finally:
         if original_workspace:
             os.environ["MLFLOW_WORKSPACE"] = original_workspace

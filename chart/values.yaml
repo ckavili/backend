@@ -42,7 +42,7 @@ shields:
   check_interval: 50
 
 feedback:
-  enabled: true
+  enabled: false
 
 ab_testing:
   enabled: false
