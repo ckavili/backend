@@ -22,6 +22,14 @@
         "https://mlflow.apps.example.com/mlflow"
       ]
     },
+    "chart_path": {
+      "type": "string",
+      "description": "Path to the Helm chart in the repository"
+    },
+    "repo_url": {
+      "type": "string",
+      "description": "URL of the source repository"
+    },
     "summarize": {
       "type": "object",
       "description": "Configuration for summarization functionality",
