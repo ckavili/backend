@@ -146,34 +146,19 @@
     },
     "shields": {
       "type": "object",
-      "description": "Configuration for input/output moderation shields",
+      "description": "NeMo Guardrails configuration — when enabled, all requests go through the NeMo Guardrails OpenAI-compatible endpoint",
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Enable or disable shields functionality",
+          "description": "Enable or disable NeMo Guardrails",
           "default": false
         },
         "endpoint": { "$ref": "#/definitions/endpoint" },
-        "input_shields": {
-          "type": "array",
-          "description": "Shield names for input moderation",
-          "items": {
-            "type": "string"
-          },
-          "examples": [
-            ["hap", "language_detection", "prompt_injection"]
-          ]
-        },
-        "output_shields": {
-          "type": "array",
-          "description": "Shield names for output moderation",
-          "items": {
-            "type": "string"
-          }
-        },
-        "check_interval": {
-          "type": "number",
-          "description": "Interval for shield checks"
+        "config": {
+          "type": "string",
+          "description": "NeMo Guardrails configuration name (maps to the config folder name in the NeMo server)",
+          "default": "canopy-guardrails",
+          "examples": ["canopy-guardrails"]
         }
       },
       "additionalProperties": false
@@ -308,6 +293,11 @@
           "type": "boolean",
           "description": "Enable or disable A/B testing",
           "default": false
+        },
+        "mlflow_prompt_b_version": {
+          "type": "string",
+          "description": "MLflow prompt alias or version to use as the challenger (B) in A/B testing",
+          "examples": ["latest", "challenger", "2"]
         }
       },
       "additionalProperties": false
